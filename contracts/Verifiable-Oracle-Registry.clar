@@ -8,6 +8,8 @@
 (define-constant ERR-INVALID-PROPOSAL (err u1006))
 (define-constant ERR-ORACLE-SLASHED (err u1007))
 (define-constant ERR-INSUFFICIENT-REPUTATION (err u1008))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u1009))
+(define-constant ERR-NO-DELEGATION-FOUND (err u1010))
 
 (define-constant MIN-STAKE u1000000)
 (define-constant MIN-REPUTATION u100)
@@ -70,6 +72,16 @@
 (define-map staker-balances
   { staker: principal }
   { amount: uint }
+)
+
+(define-map delegations
+  { delegator: principal }
+  { delegate: principal }
+)
+
+(define-map delegation-power
+  { delegate: principal }
+  { total-power: uint }
 )
 
 (define-public (register-oracle (stake uint) (metadata (string-ascii 256)))
@@ -290,6 +302,69 @@
   )
 )
 
+(define-public (delegate-voting-power (delegate principal))
+  (let
+    (
+      (delegator tx-sender)
+      (delegator-power (get-voting-power delegator))
+      (existing-delegation (map-get? delegations { delegator: delegator }))
+    )
+    (asserts! (not (is-eq delegator delegate)) ERR-CANNOT-DELEGATE-TO-SELF)
+    (asserts! (> delegator-power u0) ERR-INSUFFICIENT-STAKE)
+    
+    (match existing-delegation
+      prev-delegation
+      (let
+        (
+          (old-delegate (get delegate prev-delegation))
+          (old-delegate-power (default-to u0 (get total-power (map-get? delegation-power { delegate: old-delegate }))))
+        )
+        (map-set delegation-power
+          { delegate: old-delegate }
+          { total-power: (if (>= old-delegate-power delegator-power) (- old-delegate-power delegator-power) u0) }
+        )
+      )
+      true
+    )
+    
+    (let
+      (
+        (current-delegate-power (default-to u0 (get total-power (map-get? delegation-power { delegate: delegate }))))
+      )
+      (map-set delegation-power
+        { delegate: delegate }
+        { total-power: (+ current-delegate-power delegator-power) }
+      )
+    )
+    
+    (map-set delegations
+      { delegator: delegator }
+      { delegate: delegate }
+    )
+    
+    (ok delegate)
+  )
+)
+
+(define-public (undelegate-voting-power)
+  (let
+    (
+      (delegator tx-sender)
+      (delegation-data (unwrap! (map-get? delegations { delegator: delegator }) ERR-NO-DELEGATION-FOUND))
+      (delegate (get delegate delegation-data))
+      (delegator-power (get-voting-power delegator))
+      (current-delegate-power (default-to u0 (get total-power (map-get? delegation-power { delegate: delegate }))))
+    )
+    (map-set delegation-power
+      { delegate: delegate }
+      { total-power: (if (>= current-delegate-power delegator-power) (- current-delegate-power delegator-power) u0) }
+    )
+    
+    (map-delete delegations { delegator: delegator })
+    (ok true)
+  )
+)
+
 (define-read-only (get-oracle (oracle-id uint))
   (map-get? oracles { oracle-id: oracle-id })
 )
@@ -314,12 +389,22 @@
     (
       (stake-balance (default-to u0 (get amount (map-get? staker-balances { staker: staker }))))
       (oracle-data (get-oracle-by-owner staker))
+      (base-power (match oracle-data
+        oracle (+ stake-balance (get stake oracle))
+        stake-balance
+      ))
+      (delegated-to-staker (default-to u0 (get total-power (map-get? delegation-power { delegate: staker }))))
     )
-    (match oracle-data
-      oracle (+ stake-balance (get stake oracle))
-      stake-balance
-    )
+    (+ base-power delegated-to-staker)
   )
+)
+
+(define-read-only (get-delegation (delegator principal))
+  (map-get? delegations { delegator: delegator })
+)
+
+(define-read-only (get-delegated-power (delegate principal))
+  (default-to u0 (get total-power (map-get? delegation-power { delegate: delegate })))
 )
 
 (define-read-only (get-oracle-reputation (oracle-id uint))
