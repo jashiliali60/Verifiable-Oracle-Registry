@@ -10,12 +10,14 @@
 (define-constant ERR-INSUFFICIENT-REPUTATION (err u1008))
 (define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u1009))
 (define-constant ERR-NO-DELEGATION-FOUND (err u1010))
+(define-constant ERR-NOT-IN-LEADERBOARD (err u1011))
 
 (define-constant MIN-STAKE u1000000)
 (define-constant MIN-REPUTATION u100)
 (define-constant VOTING-PERIOD u144)
 (define-constant SLASH-PERCENTAGE u20)
 (define-constant REWARD-PERCENTAGE u5)
+(define-constant LEADERBOARD-SIZE u10)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-oracles uint u0)
@@ -82,6 +84,16 @@
 (define-map delegation-power
   { delegate: principal }
   { total-power: uint }
+)
+
+(define-map leaderboard-positions
+  { oracle-id: uint }
+  { rank: uint, performance-score: uint }
+)
+
+(define-map leaderboard-rankings
+  { rank: uint }
+  { oracle-id: uint }
 )
 
 (define-public (register-oracle (stake uint) (metadata (string-ascii 256)))
@@ -173,7 +185,19 @@
     )
     
     (if is-valid
-      (begin (try! (distribute-reward oracle-id caller)) true)
+      (begin 
+        (try! (distribute-reward oracle-id caller))
+        (let
+          (
+            (current-score (get-performance-score oracle-id))
+          )
+          (map-set leaderboard-positions
+            { oracle-id: oracle-id }
+            { rank: u0, performance-score: current-score }
+          )
+        )
+        true
+      )
       (begin (try! (slash-oracle oracle-id)) true)
     )
     
@@ -425,6 +449,53 @@
   )
 )
 
+(define-read-only (get-performance-score (oracle-id uint))
+  (match (get-oracle oracle-id)
+    oracle-data
+    (let
+      (
+        (reputation (get reputation oracle-data))
+        (total-reports (get total-reports oracle-data))
+        (successful-reports (get successful-reports oracle-data))
+        (stake (get stake oracle-data))
+      )
+      (if (is-eq total-reports u0)
+        u0
+        (+ (* reputation u100) (* successful-reports u10) (/ stake u100000))
+      )
+    )
+    u0
+  )
+)
+
+(define-read-only (get-leaderboard-rank (oracle-id uint))
+  (match (map-get? leaderboard-positions { oracle-id: oracle-id })
+    position (some (get rank position))
+    none
+  )
+)
+
+(define-read-only (get-oracle-at-rank (rank uint))
+  (match (map-get? leaderboard-rankings { rank: rank })
+    ranking (some (get oracle-id ranking))
+    none
+  )
+)
+
+(define-read-only (get-reward-multiplier (oracle-id uint))
+  (match (get-leaderboard-rank oracle-id)
+    rank
+    (if (<= rank u3)
+      u150
+      (if (<= rank u7)
+        u125
+        u100
+      )
+    )
+    u100
+  )
+)
+
 (define-private (calculate-reputation (total-reports uint) (successful-reports uint))
   (if (is-eq total-reports u0)
     u100
@@ -446,6 +517,10 @@
         status: "slashed"
       })
     )
+    (match (get-leaderboard-rank oracle-id)
+      rank (map-delete leaderboard-positions { oracle-id: oracle-id })
+      true
+    )
     (ok slash-amount)
   )
 )
@@ -454,9 +529,35 @@
   (let
     (
       (oracle-data (unwrap! (map-get? oracles { oracle-id: oracle-id }) ERR-ORACLE-NOT-FOUND))
-      (reward-amount (/ (* (get stake oracle-data) REWARD-PERCENTAGE) u100))
+      (base-reward (/ (* (get stake oracle-data) REWARD-PERCENTAGE) u100))
+      (multiplier (get-reward-multiplier oracle-id))
+      (reward-amount (/ (* base-reward multiplier) u100))
     )
     (as-contract (stx-transfer? reward-amount tx-sender verifier))
+  )
+)
+
+(define-public (update-oracle-rank (oracle-id uint) (new-rank uint))
+  (let
+    (
+      (caller tx-sender)
+      (oracle-data (unwrap! (map-get? oracles { oracle-id: oracle-id }) ERR-ORACLE-NOT-FOUND))
+      (current-score (get-performance-score oracle-id))
+    )
+    (asserts! (is-eq caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-rank LEADERBOARD-SIZE) ERR-NOT-IN-LEADERBOARD)
+    
+    (map-set leaderboard-positions
+      { oracle-id: oracle-id }
+      { rank: new-rank, performance-score: current-score }
+    )
+    
+    (map-set leaderboard-rankings
+      { rank: new-rank }
+      { oracle-id: oracle-id }
+    )
+    
+    (ok true)
   )
 )
 
